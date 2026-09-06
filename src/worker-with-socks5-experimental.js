@@ -13,6 +13,82 @@ let proxyIP = '';
 // Example:  user:pass@host:port  or  host:port
 let socks5Address = '';
 
+const DEBUG_RAW_DATA_LIMIT = 4096;
+
+function debugLog(event, details = {}) {
+	console.log(`[edgetunnel-debug] ${JSON.stringify({
+		time: new Date().toISOString(),
+		event,
+		...details,
+	})}`);
+}
+
+function createRequestId() {
+	return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function describeBinary(value) {
+	const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+	const preview = bytes.slice(0, DEBUG_RAW_DATA_LIMIT);
+	let textPreview = '';
+	try {
+		textPreview = new TextDecoder().decode(preview);
+	} catch (error) {
+		textPreview = '';
+	}
+	return {
+		byteLength: bytes.byteLength,
+		truncated: bytes.byteLength > DEBUG_RAW_DATA_LIMIT,
+		hexPreview: Array.from(preview, byte => byte.toString(16).padStart(2, '0')).join(''),
+		base64Preview: btoa(String.fromCharCode(...preview)),
+		textPreview,
+	};
+}
+
+async function logRequest(request, requestId) {
+	let body;
+	try {
+		const requestBody = await request.clone().arrayBuffer();
+		body = requestBody.byteLength ? describeBinary(requestBody) : null;
+	} catch (error) {
+		body = { error: String(error) };
+	}
+	debugLog('request.received', {
+		requestId,
+		method: request.method,
+		url: request.url,
+		clientIp: request.headers.get('CF-Connecting-IP'),
+		forwardedFor: request.headers.get('X-Forwarded-For'),
+		userAgent: request.headers.get('User-Agent'),
+		upgrade: request.headers.get('Upgrade'),
+		headers: Object.fromEntries(request.headers),
+		cf: request.cf || null,
+		body,
+	});
+}
+
+async function logResponse(response, requestId) {
+	let body;
+	try {
+		if (response.status === 101) {
+			body = null;
+		} else {
+			const responseBody = await response.clone().arrayBuffer();
+			body = responseBody.byteLength ? describeBinary(responseBody) : null;
+		}
+	} catch (error) {
+		body = { error: String(error) };
+	}
+	debugLog('response.sent', {
+		requestId,
+		status: response.status,
+		statusText: response.statusText,
+		headers: Object.fromEntries(response.headers),
+		body,
+	});
+	return response;
+}
+
 if (!isValidUUID(userID)) {
 	throw new Error('uuid is not valid');
 }
@@ -28,6 +104,8 @@ export default {
 	 * @returns {Promise<Response>}
 	 */
 	async fetch(request, env, ctx) {
+		const requestId = createRequestId();
+		await logRequest(request, requestId);
 		try {
 			userID = env.UUID || userID;
 			proxyIP = env.PROXYIP || proxyIP;
@@ -47,25 +125,26 @@ export default {
 				const url = new URL(request.url);
 				switch (url.pathname) {
 					case '/':
-						return new Response(JSON.stringify(request.cf), { status: 200 });
+						return await logResponse(new Response(JSON.stringify(request.cf), { status: 200 }), requestId);
 					case `/${userID}`: {
 						const vlessConfig = getVLESSConfig(userID, request.headers.get('Host'));
-						return new Response(`${vlessConfig}`, {
+						return await logResponse(new Response(`${vlessConfig}`, {
 							status: 200,
 							headers: {
 								"Content-Type": "text/plain;charset=utf-8",
 							}
-						});
+						}), requestId);
 					}
 					default:
-						return new Response('Not found', { status: 404 });
+						return await logResponse(new Response('Not found', { status: 404 }), requestId);
 				}
 			} else {
-				return await vlessOverWSHandler(request);
+				return await logResponse(await vlessOverWSHandler(request, requestId), requestId);
 			}
 		} catch (err) {
 			/** @type {Error} */ let e = err;
-			return new Response(e.toString());
+			debugLog('request.error', { requestId, error: e.stack || e.toString() });
+			return await logResponse(new Response(e.toString()), requestId);
 		}
 	},
 };
@@ -77,7 +156,7 @@ export default {
  * 
  * @param {import("@cloudflare/workers-types").Request} request
  */
-async function vlessOverWSHandler(request) {
+async function vlessOverWSHandler(request, requestId) {
 
 	/** @type {import("@cloudflare/workers-types").WebSocket[]} */
 	// @ts-ignore
@@ -88,8 +167,9 @@ async function vlessOverWSHandler(request) {
 
 	let address = '';
 	let portWithRandomLog = '';
-	const log = (/** @type {string} */ info, /** @type {string | undefined} */ event) => {
+	const log = (/** @type {string} */ info, /** @type {*} */ event) => {
 		console.log(`[${address}:${portWithRandomLog}] ${info}`, event || '');
+		debugLog('websocket.event', { requestId, address, port: portWithRandomLog, info, event });
 	};
 	const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
 
@@ -104,6 +184,7 @@ async function vlessOverWSHandler(request) {
 	// ws --> remote
 	readableWebSocketStream.pipeTo(new WritableStream({
 		async write(chunk, controller) {
+			log('client -> worker frame', describeBinary(chunk));
 			if (isDns) {
 				return await handleDNSQuery(chunk, webSocket, null, log);
 			}
@@ -128,6 +209,7 @@ async function vlessOverWSHandler(request) {
 			portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '
 				} `;
 			if (hasError) {
+				log('invalid VLESS header', message);
 				// controller.error(message);
 				throw new Error(message); // cf seems has bug, controller.error will not end stream
 				// webSocket.close(1000, message);
@@ -146,6 +228,13 @@ async function vlessOverWSHandler(request) {
 			// ["version", "附加信息长度 N"]
 			const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
 			const rawClientData = chunk.slice(rawDataIndex);
+			log('VLESS request parsed', {
+				addressType,
+				addressRemote,
+				portRemote,
+				isUDP,
+				rawData: describeBinary(rawClientData),
+			});
 
 			if (isDns) {
 				return handleDNSQuery(rawClientData, webSocket, vlessResponseHeader, log);
@@ -436,6 +525,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, re
 				 */
 				async write(chunk, controller) {
 					hasIncomingData = true;
+					log('remote -> client frame', describeBinary(chunk));
 					// remoteChunkCount++;
 					if (webSocket.readyState !== WS_READY_STATE_OPEN) {
 						controller.error(
@@ -563,10 +653,12 @@ async function handleDNSQuery(udpChunk, webSocket, vlessResponseHeader, log) {
 
 		log(`connected to ${dnsServer}:${dnsPort}`);
 		const writer = tcpSocket.writable.getWriter();
+		log('DNS over TCP request', describeBinary(udpChunk));
 		await writer.write(udpChunk);
 		writer.releaseLock();
 		await tcpSocket.readable.pipeTo(new WritableStream({
 			async write(chunk) {
+				log('DNS over TCP response', describeBinary(chunk));
 				if (webSocket.readyState === WS_READY_STATE_OPEN) {
 					if (vlessHeader) {
 						webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
@@ -621,7 +713,7 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
 	const writer = socket.writable.getWriter();
 
 	await writer.write(socksGreeting);
-	log('sent socks greeting');
+	log('sent socks greeting', describeBinary(socksGreeting));
 
 	const reader = socket.readable.getReader();
 	const encoder = new TextEncoder();
@@ -661,6 +753,7 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
 			...encoder.encode(password)
 		]);
 		await writer.write(authRequest);
+		log('sent socks authentication request', describeBinary(authRequest));
 		res = (await reader.read()).value;
 		// expected 0x0100
 		if (res[0] !== 0x01 || res[1] !== 0x00) {
@@ -709,7 +802,7 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
 	}
 	const socksRequest = new Uint8Array([5, 1, 0, ...DSTADDR, portRemote >> 8, portRemote & 0xff]);
 	await writer.write(socksRequest);
-	log('sent socks request');
+	log('sent socks request', describeBinary(socksRequest));
 
 	res = (await reader.read()).value;
 	// Response format (Socks Server -> Worker):
