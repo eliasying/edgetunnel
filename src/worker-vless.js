@@ -15,6 +15,11 @@ function debugLog(event, details = {}) {
 		time: new Date().toISOString(),
 		event,
 		...details,
+	}, (key, value) => {
+		if (value instanceof Error) {
+			return { name: value.name, message: value.message, stack: value.stack };
+		}
+		return value;
 	})}`);
 }
 
@@ -150,8 +155,11 @@ async function vlessOverWSHandler(request, requestId) {
 	let address = '';
 	let portWithRandomLog = '';
 	const log = (/** @type {string} */ info, /** @type {*} */ event) => {
-		console.log(`[${address}:${portWithRandomLog}] ${info}`, event || '');
-		debugLog('websocket.event', { requestId, address, port: portWithRandomLog, info, event });
+		const details = event instanceof Error
+			? { name: event.name, message: event.message, stack: event.stack }
+			: event;
+		console.log(`[${address}:${portWithRandomLog}] ${info}`, JSON.stringify(details || ''));
+		debugLog('websocket.event', { requestId, address, port: portWithRandomLog, info, event: details });
 	};
 	const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
 
@@ -181,6 +189,7 @@ async function vlessOverWSHandler(request, requestId) {
 			const {
 				hasError,
 				message,
+				addressType,
 				portRemote = 443,
 				addressRemote = '',
 				rawDataIndex,
