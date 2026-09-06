@@ -4,42 +4,39 @@ import { connect } from 'cloudflare:sockets';
 
 // How to generate your own UUID:
 // [Windows] Press "Win + R", input cmd and run:  Powershell -NoExit -Command "[guid]::NewGuid()"
-let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
-
-let proxyIP = '';
+const DEFAULT_USER_ID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
+const DEFAULT_PROXY_IP = '';
 
 // The user name and password do not contain special characters
 // Setting the address will ignore proxyIP
 // Example:  user:pass@host:port  or  host:port
-let socks5Address = '';
+const DEFAULT_SOCKS5_ADDRESS = '';
 
-if (!isValidUUID(userID)) {
+if (!isValidUUID(DEFAULT_USER_ID)) {
 	throw new Error('uuid is not valid');
 }
-
-let parsedSocks5Address = {}; 
-let enableSocks = false;
 
 export default {
 	/**
 	 * @param {import("@cloudflare/workers-types").Request} request
-	 * @param {{UUID: string, PROXYIP: string}} env
+	 * @param {{UUID: string, PROXYIP: string, SOCKS5: string}} env
 	 * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
 	 * @returns {Promise<Response>}
 	 */
 	async fetch(request, env, ctx) {
 		try {
-			userID = env.UUID || userID;
-			proxyIP = env.PROXYIP || proxyIP;
-			socks5Address = env.SOCKS5 || socks5Address;
+			const userID = env.UUID || DEFAULT_USER_ID;
+			const proxyIP = env.PROXYIP || DEFAULT_PROXY_IP;
+			const socks5Address = env.SOCKS5 || DEFAULT_SOCKS5_ADDRESS;
+			let enableSocks = false;
+			let parsedSocks5Address = {};
 			if (socks5Address) {
 				try {
 					parsedSocks5Address = socks5AddressParser(socks5Address);
 					enableSocks = true;
 				} catch (err) {
-  			/** @type {Error} */ let e = err;
+					/** @type {Error} */ let e = err;
 					console.log(e.toString());
-					enableSocks = false;
 				}
 			}
 			const upgradeHeader = request.headers.get('Upgrade');
@@ -61,7 +58,7 @@ export default {
 						return new Response('Not found', { status: 404 });
 				}
 			} else {
-				return await vlessOverWSHandler(request);
+				return await vlessOverWSHandler(request, { userID, proxyIP, enableSocks, parsedSocks5Address });
 			}
 		} catch (err) {
 			/** @type {Error} */ let e = err;
@@ -74,10 +71,11 @@ export default {
 
 
 /**
- * 
+ *
  * @param {import("@cloudflare/workers-types").Request} request
+ * @param {{ userID: string, proxyIP: string, enableSocks: boolean, parsedSocks5Address: object }} config
  */
-async function vlessOverWSHandler(request) {
+async function vlessOverWSHandler(request, config) {
 
 	/** @type {import("@cloudflare/workers-types").WebSocket[]} */
 	// @ts-ignore
@@ -123,7 +121,7 @@ async function vlessOverWSHandler(request) {
 				rawDataIndex,
 				vlessVersion = new Uint8Array([0, 0]),
 				isUDP,
-			} = processVlessHeader(chunk, userID);
+			} = processVlessHeader(chunk, config.userID);
 			address = addressRemote;
 			portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '
 				} `;
@@ -131,7 +129,6 @@ async function vlessOverWSHandler(request) {
 				// controller.error(message);
 				throw new Error(message); // cf seems has bug, controller.error will not end stream
 				// webSocket.close(1000, message);
-				return;
 			}
 			// if UDP but port not DNS port, close it
 			if (isUDP) {
@@ -140,7 +137,6 @@ async function vlessOverWSHandler(request) {
 				} else {
 					// controller.error('UDP proxy only enable for DNS which is port 53');
 					throw new Error('UDP proxy only enable for DNS which is port 53'); // cf seems has bug, controller.error will not end stream
-					return;
 				}
 			}
 			// ["version", "附加信息长度 N"]
@@ -150,7 +146,7 @@ async function vlessOverWSHandler(request) {
 			if (isDns) {
 				return handleDNSQuery(rawClientData, webSocket, vlessResponseHeader, log);
 			}
-			handleTCPOutBound(remoteSocketWapper, addressType, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log);
+			handleTCPOutBound(remoteSocketWapper, addressType, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log, config);
 		},
 		close() {
 			log(`readableWebSocketStream is close`);
@@ -180,12 +176,13 @@ async function vlessOverWSHandler(request) {
  * @param {import("@cloudflare/workers-types").WebSocket} webSocket The WebSocket to pass the remote socket to.
  * @param {Uint8Array} vlessResponseHeader The VLESS response header.
  * @param {function} log The logging function.
- * @returns {Promise<void>} The remote socket.
+ * @param {{ userID: string, proxyIP: string, enableSocks: boolean, parsedSocks5Address: object }} config
+ * @returns {Promise<void>}
  */
-async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log,) {
+async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log, config) {
 	async function connectAndWrite(address, port, socks = false) {
 		/** @type {import("@cloudflare/workers-types").Socket} */
-		const tcpSocket = socks ? await socks5Connect(addressType, address, port, log)
+		const tcpSocket = socks ? await socks5Connect(config.parsedSocks5Address, addressType, address, port, log)
 			: connect({
 				hostname: address,
 				port: port,
@@ -193,17 +190,17 @@ async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portR
 		remoteSocket.value = tcpSocket;
 		log(`connected to ${address}:${port}`);
 		const writer = tcpSocket.writable.getWriter();
-		await writer.write(rawClientData); // first write, normal is tls client hello
+		await writer.write(rawClientData); // first write, normally is tls client hello
 		writer.releaseLock();
 		return tcpSocket;
 	}
 
 	// if the cf connect tcp socket have no incoming data, we retry to redirect ip
 	async function retry() {
-		if (enableSocks) {
+		if (config.enableSocks) {
 			tcpSocket = await connectAndWrite(addressRemote, portRemote, true);
 		} else {
-			tcpSocket = await connectAndWrite(proxyIP || addressRemote, portRemote);
+			tcpSocket = await connectAndWrite(config.proxyIP || addressRemote, portRemote);
 		}
 		// no matter retry success or not, close websocket
 		tcpSocket.closed.catch(error => {
@@ -387,7 +384,7 @@ function processVlessHeader(
 		default:
 			return {
 				hasError: true,
-				message: `invild  addressType is ${addressType}`,
+				message: `invalid addressType is ${addressType}`,
 			};
 	}
 	if (!addressValue) {
@@ -420,7 +417,6 @@ function processVlessHeader(
 async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
 	// remote--> ws
 	let remoteChunkCount = 0;
-	let chunks = [];
 	/** @type {ArrayBuffer | null} */
 	let vlessHeader = vlessResponseHeader;
 	let hasIncomingData = false; // check if remoteSocket has incoming data
@@ -456,7 +452,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, re
 				},
 				close() {
 					log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
-					// safeCloseWebSocket(webSocket); // no need server close websocket frist for some case will casue HTTP ERR_CONTENT_LENGTH_MISMATCH issue, client will send close event anyway.
+					// safeCloseWebSocket(webSocket); // no need server close websocket first for some case will cause HTTP ERR_CONTENT_LENGTH_MISMATCH issue, client will send close event anyway.
 				},
 				abort(reason) {
 					console.error(`remoteConnection!.readable abort`, reason);
@@ -512,7 +508,7 @@ function isValidUUID(uuid) {
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 /**
- * Normally, WebSocket will not has exceptions when close.
+ * Normally, WebSocket will not throw an exception when closing.
  * @param {import("@cloudflare/workers-types").WebSocket} socket
  */
 function safeCloseWebSocket(socket) {
@@ -548,8 +544,8 @@ function stringify(arr, offset = 0) {
  * @param {(string)=> void} log 
  */
 async function handleDNSQuery(udpChunk, webSocket, vlessResponseHeader, log) {
-	// no matter which DNS server client send, we alwasy use hard code one.
-	// beacsue someof DNS server is not support DNS over TCP
+	// no matter which DNS server client send, we always use hard code one.
+	// because some DNS servers do not support DNS over TCP
 	try {
 		const dnsServer = '8.8.4.4'; // change to 1.1.1.1 after cf fix connect own ip bug
 		const dnsPort = 53;
@@ -591,14 +587,15 @@ async function handleDNSQuery(udpChunk, webSocket, vlessResponseHeader, log) {
 }
 
 /**
- * 
+ *
+ * @param {{ username?: string, password?: string, hostname: string, port: number }} socks5Config
  * @param {number} addressType
  * @param {string} addressRemote
  * @param {number} portRemote
  * @param {function} log The logging function.
  */
-async function socks5Connect(addressType, addressRemote, portRemote, log) {
-	const { username, password, hostname, port } = parsedSocks5Address;
+async function socks5Connect(socks5Config, addressType, addressRemote, portRemote, log) {
+	const { username, password, hostname, port } = socks5Config;
 	// Connect to the SOCKS server
 	const socket = connect({
 		hostname,
@@ -705,7 +702,7 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
 			);
 			break;
 		default:
-			log(`invild  addressType is ${addressType}`);
+			log(`invalid addressType is ${addressType}`);
 			return;
 	}
 	const socksRequest = new Uint8Array([5, 1, 0, ...DSTADDR, portRemote >> 8, portRemote & 0xff]);

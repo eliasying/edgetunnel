@@ -4,12 +4,10 @@ import { connect } from 'cloudflare:sockets';
 
 // How to generate your own UUID:
 // [Windows] Press "Win + R", input cmd and run:  Powershell -NoExit -Command "[guid]::NewGuid()"
-let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
+const DEFAULT_USER_ID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
+const DEFAULT_PROXY_IP = '';
 
-let proxyIP = '';
-
-
-if (!isValidUUID(userID)) {
+if (!isValidUUID(DEFAULT_USER_ID)) {
 	throw new Error('uuid is not valid');
 }
 
@@ -22,8 +20,8 @@ export default {
 	 */
 	async fetch(request, env, ctx) {
 		try {
-			userID = env.UUID || userID;
-			proxyIP = env.PROXYIP || proxyIP;
+			const userID = env.UUID || DEFAULT_USER_ID;
+			const proxyIP = env.PROXYIP || DEFAULT_PROXY_IP;
 			const upgradeHeader = request.headers.get('Upgrade');
 			if (!upgradeHeader || upgradeHeader !== 'websocket') {
 				const url = new URL(request.url);
@@ -43,7 +41,7 @@ export default {
 						return new Response('Not found', { status: 404 });
 				}
 			} else {
-				return await vlessOverWSHandler(request);
+				return await vlessOverWSHandler(request, { userID, proxyIP });
 			}
 		} catch (err) {
 			/** @type {Error} */ let e = err;
@@ -56,10 +54,11 @@ export default {
 
 
 /**
- * 
+ *
  * @param {import("@cloudflare/workers-types").Request} request
+ * @param {{ userID: string, proxyIP: string }} config
  */
-async function vlessOverWSHandler(request) {
+async function vlessOverWSHandler(request, config) {
 
 	/** @type {import("@cloudflare/workers-types").WebSocket[]} */
 	// @ts-ignore
@@ -105,7 +104,7 @@ async function vlessOverWSHandler(request) {
 				rawDataIndex,
 				vlessVersion = new Uint8Array([0, 0]),
 				isUDP,
-			} = processVlessHeader(chunk, userID);
+			} = processVlessHeader(chunk, config.userID);
 			address = addressRemote;
 			portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '
 				} `;
@@ -113,7 +112,6 @@ async function vlessOverWSHandler(request) {
 				// controller.error(message);
 				throw new Error(message); // cf seems has bug, controller.error will not end stream
 				// webSocket.close(1000, message);
-				return;
 			}
 			// if UDP but port not DNS port, close it
 			if (isUDP) {
@@ -122,7 +120,6 @@ async function vlessOverWSHandler(request) {
 				} else {
 					// controller.error('UDP proxy only enable for DNS which is port 53');
 					throw new Error('UDP proxy only enable for DNS which is port 53'); // cf seems has bug, controller.error will not end stream
-					return;
 				}
 			}
 			// ["version", "附加信息长度 N"]
@@ -136,7 +133,7 @@ async function vlessOverWSHandler(request) {
 				udpStreamWrite(rawClientData);
 				return;
 			}
-			handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log);
+			handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log, config);
 		},
 		close() {
 			log(`readableWebSocketStream is close`);
@@ -165,9 +162,10 @@ async function vlessOverWSHandler(request) {
  * @param {import("@cloudflare/workers-types").WebSocket} webSocket The WebSocket to pass the remote socket to.
  * @param {Uint8Array} vlessResponseHeader The VLESS response header.
  * @param {function} log The logging function.
- * @returns {Promise<void>} The remote socket.
+ * @param {{ userID: string, proxyIP: string }} config
+ * @returns {Promise<void>}
  */
-async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log,) {
+async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log, config) {
 	async function connectAndWrite(address, port) {
 		/** @type {import("@cloudflare/workers-types").Socket} */
 		const tcpSocket = connect({
@@ -177,14 +175,14 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
 		remoteSocket.value = tcpSocket;
 		log(`connected to ${address}:${port}`);
 		const writer = tcpSocket.writable.getWriter();
-		await writer.write(rawClientData); // first write, nomal is tls client hello
+		await writer.write(rawClientData); // first write, normally is tls client hello
 		writer.releaseLock();
 		return tcpSocket;
 	}
 
 	// if the cf connect tcp socket have no incoming data, we retry to redirect ip
 	async function retry() {
-		const tcpSocket = await connectAndWrite(proxyIP || addressRemote, portRemote)
+		const tcpSocket = await connectAndWrite(config.proxyIP || addressRemote, portRemote)
 		// no matter retry success or not, close websocket
 		tcpSocket.closed.catch(error => {
 			console.log('retry tcpSocket closed error', error);
@@ -367,7 +365,7 @@ function processVlessHeader(
 		default:
 			return {
 				hasError: true,
-				message: `invild  addressType is ${addressType}`,
+				message: `invalid addressType is ${addressType}`,
 			};
 	}
 	if (!addressValue) {
@@ -400,7 +398,6 @@ function processVlessHeader(
 async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
 	// remote--> ws
 	let remoteChunkCount = 0;
-	let chunks = [];
 	/** @type {ArrayBuffer | null} */
 	let vlessHeader = vlessResponseHeader;
 	let hasIncomingData = false; // check if remoteSocket has incoming data
@@ -436,7 +433,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, re
 				},
 				close() {
 					log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
-					// safeCloseWebSocket(webSocket); // no need server close websocket frist for some case will casue HTTP ERR_CONTENT_LENGTH_MISMATCH issue, client will send close event anyway.
+					// safeCloseWebSocket(webSocket); // no need server close websocket first for some case will cause HTTP ERR_CONTENT_LENGTH_MISMATCH issue, client will send close event anyway.
 				},
 				abort(reason) {
 					console.error(`remoteConnection!.readable abort`, reason);
@@ -492,7 +489,7 @@ function isValidUUID(uuid) {
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 /**
- * Normally, WebSocket will not has exceptions when close.
+ * Normally, WebSocket will not throw an exception when closing.
  * @param {import("@cloudflare/workers-types").WebSocket} socket
  */
 function safeCloseWebSocket(socket) {
@@ -535,8 +532,8 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
 
 		},
 		transform(chunk, controller) {
-			// udp message 2 byte is the the length of udp data
-			// TODO: this should have bug, beacsue maybe udp chunk can be in two websocket message
+			// udp message 2 byte is the length of udp data
+			// TODO: this should have bug, because maybe udp chunk can be in two websocket message
 			for (let index = 0; index < chunk.byteLength;) {
 				const lengthBuffer = chunk.slice(index, index + 2);
 				const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
